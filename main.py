@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 from urllib.parse import unquote, urlparse
 import re
+import os
 
 app = Flask(__name__)
 
@@ -18,19 +19,25 @@ CHANNELS = {
 }
 
 
+# =================================================
+# RESPONSE
+# =================================================
+
 def result(safe, reason):
-    return jsonify({
+    response = jsonify({
         "safe": safe,
         "reason": reason
-    }), 200
+    })
+    response.status_code = 200
+    return response
 
 
-# -------------------------------------------------
+# =================================================
 # HTML ENTITY DECODING
-# Only the entities specified by the question
-# -------------------------------------------------
+# =================================================
 
 def decode_html_entities(text):
+
     entities = {
         "&lt;": "<",
         "&gt;": ">",
@@ -39,44 +46,43 @@ def decode_html_entities(text):
         "&amp;": "&"
     }
 
-    def replace_entity(match):
+    pattern = re.compile(
+        r"&(?:lt|gt|quot|apos|amp);"
+        r"|&#[0-9]+;"
+        r"|&#x[0-9a-fA-F]+;"
+    )
+
+    def replace(match):
+
         value = match.group(0)
 
-        # Named entities
         if value in entities:
             return entities[value]
 
-        # Numeric decimal: &#NN;
-        if re.fullmatch(r"&#[0-9]+;", value):
-            number = int(value[2:-1])
+        if value.startswith("&#x"):
             try:
-                return chr(number)
+                return chr(int(value[3:-1], 16))
             except ValueError:
                 return value
 
-        # Numeric hexadecimal: &#xNN;
-        if re.fullmatch(r"&#x[0-9a-fA-F]+;", value):
-            number = int(value[3:-1], 16)
+        if value.startswith("&#"):
             try:
-                return chr(number)
+                return chr(int(value[2:-1], 10))
             except ValueError:
                 return value
 
         return value
 
-    return re.sub(
-        r"&(?:lt|gt|quot|apos|amp);|&#[0-9]+;|&#x[0-9a-fA-F]+;",
-        replace_entity,
-        text
-    )
+    return pattern.sub(replace, text)
 
 
-# -------------------------------------------------
-# \uXXXX DECODING
-# -------------------------------------------------
+# =================================================
+# UNICODE ESCAPE DECODING
+# =================================================
 
 def decode_unicode_escapes(text):
-    def replace_unicode(match):
+
+    def replace(match):
         try:
             return chr(int(match.group(1), 16))
         except ValueError:
@@ -84,36 +90,43 @@ def decode_unicode_escapes(text):
 
     return re.sub(
         r"\\u([0-9a-fA-F]{4})",
-        replace_unicode,
+        replace,
         text
     )
 
 
-# -------------------------------------------------
-# DECODE ONCE
-# Order:
-# percent escapes
-# HTML entities
-# \uXXXX
-# -------------------------------------------------
+# =================================================
+# DECODE EXACTLY ONCE
+# =================================================
 
 def decode_once(text):
+
+    # 1. Percent escapes
     decoded = unquote(text)
+
+    # 2. HTML entities
     decoded = decode_html_entities(decoded)
+
+    # 3. \uXXXX escapes
     decoded = decode_unicode_escapes(decoded)
+
     return decoded
 
 
-# -------------------------------------------------
+# =================================================
 # URL EXTRACTION
-# -------------------------------------------------
+# =================================================
 
 def extract_urls(channel, text):
 
     urls = []
 
+    # -------------------------
+    # HTML
+    # -------------------------
+
     if channel == "html":
-        # Only quoted src= and href=
+
         pattern = re.compile(
             r"""(?:src|href)\s*=\s*(['"])(.*?)\1""",
             re.IGNORECASE | re.DOTALL
@@ -122,58 +135,72 @@ def extract_urls(channel, text):
         for match in pattern.finditer(text):
             urls.append(match.group(2))
 
+    # -------------------------
+    # MARKDOWN
+    # -------------------------
+
     elif channel == "markdown":
-        # Target inside ](...)
+
         pattern = re.compile(
             r"\]\((.*?)\)",
             re.DOTALL
         )
 
         for match in pattern.finditer(text):
+
             target = match.group(1).strip()
 
-            # Remove optional title portion approximately:
-            # ](https://example.com "title")
+            # <https://example.com>
             if target.startswith("<"):
                 end = target.find(">")
+
                 if end != -1:
                     target = target[1:end]
 
             else:
+                # Remove optional markdown title
                 target = target.split(None, 1)[0]
 
             urls.append(target)
 
+    # -------------------------
+    # URL
+    # -------------------------
+
     elif channel == "url":
+
         urls.append(text.strip())
 
     return urls
 
 
-# -------------------------------------------------
+# =================================================
 # DANGEROUS SCHEME
-# -------------------------------------------------
+# =================================================
 
 def has_dangerous_scheme(channel, text):
 
-    # javascript:, data:, vbscript:
-    # optional whitespace before :
-    direct_pattern = re.compile(
+    # javascript:
+    # data:
+    # vbscript:
+    #
+    # Optional whitespace before colon
+
+    dangerous = re.compile(
         r"(?:javascript|data|vbscript)\s*:",
         re.IGNORECASE
     )
 
-    if direct_pattern.search(text):
+    if dangerous.search(text):
         return True
 
-    # Extract URLs and inspect their schemes
     urls = extract_urls(channel, text)
 
     for value in urls:
 
         value = value.strip()
 
-        # Protocol-relative URL is treated as HTTPS
+        # Protocol-relative URL
         if value.startswith("//"):
             scheme = "https"
 
@@ -181,16 +208,21 @@ def has_dangerous_scheme(channel, text):
             parsed = urlparse(value)
             scheme = parsed.scheme.lower()
 
-        # Absolute URL with a scheme other than http/https
-        if scheme and scheme not in {"http", "https"}:
+        # Any extracted URL with a scheme other than
+        # http / https is dangerous.
+
+        if scheme and scheme not in {
+            "http",
+            "https"
+        }:
             return True
 
     return False
 
 
-# -------------------------------------------------
+# =================================================
 # EXTERNAL EXFILTRATION
-# -------------------------------------------------
+# =================================================
 
 def has_external_exfil(channel, text):
 
@@ -200,15 +232,20 @@ def has_external_exfil(channel, text):
 
         value = value.strip()
 
-        # Protocol-relative URLs are absolute
+        # Protocol-relative URL
         if value.startswith("//"):
             parsed = urlparse("https:" + value)
 
         else:
             parsed = urlparse(value)
 
-        # Only absolute http/https URLs matter here
-        if parsed.scheme.lower() not in {"http", "https"}:
+        scheme = parsed.scheme.lower()
+
+        # Only absolute HTTP/HTTPS URLs
+        if scheme not in {
+            "http",
+            "https"
+        }:
             continue
 
         hostname = parsed.hostname
@@ -216,20 +253,23 @@ def has_external_exfil(channel, text):
         if hostname is None:
             return True
 
-        # Exact hostname comparison
-        if hostname.lower() not in ALLOWED_HOSTS:
+        hostname = hostname.lower()
+
+        # EXACT hostname match
+        if hostname not in ALLOWED_HOSTS:
             return True
 
     return False
 
 
-# -------------------------------------------------
-# HTML RULES
-# -------------------------------------------------
+# =================================================
+# HTML
+# =================================================
 
 def check_html(text):
 
     # 1. SCRIPT_TAG
+
     script_pattern = re.compile(
         r"<\s*(script|iframe|object|embed)\b",
         re.IGNORECASE
@@ -239,6 +279,7 @@ def check_html(text):
         return "SCRIPT_TAG"
 
     # 2. EVENT_HANDLER
+
     event_pattern = re.compile(
         r"\bon[a-zA-Z0-9_-]+\s*=",
         re.IGNORECASE
@@ -248,53 +289,59 @@ def check_html(text):
         return "EVENT_HANDLER"
 
     # 3. DANGEROUS_SCHEME
+
     if has_dangerous_scheme("html", text):
         return "DANGEROUS_SCHEME"
 
     # 4. EXTERNAL_EXFIL
+
     if has_external_exfil("html", text):
         return "EXTERNAL_EXFIL"
 
     return None
 
 
-# -------------------------------------------------
-# MARKDOWN RULES
-# -------------------------------------------------
+# =================================================
+# MARKDOWN
+# =================================================
 
 def check_markdown(text):
 
     # 1. DANGEROUS_SCHEME
+
     if has_dangerous_scheme("markdown", text):
         return "DANGEROUS_SCHEME"
 
     # 2. EXTERNAL_EXFIL
+
     if has_external_exfil("markdown", text):
         return "EXTERNAL_EXFIL"
 
     return None
 
 
-# -------------------------------------------------
-# URL RULES
-# -------------------------------------------------
+# =================================================
+# URL
+# =================================================
 
 def check_url(text):
 
     # 1. DANGEROUS_SCHEME
+
     if has_dangerous_scheme("url", text):
         return "DANGEROUS_SCHEME"
 
     # 2. EXTERNAL_EXFIL
+
     if has_external_exfil("url", text):
         return "EXTERNAL_EXFIL"
 
     return None
 
 
-# -------------------------------------------------
-# SQL RULES
-# -------------------------------------------------
+# =================================================
+# SQL
+# =================================================
 
 def check_sql(text):
 
@@ -313,26 +360,43 @@ def check_sql(text):
     if "/*" in text:
         return "SQL_METACHAR"
 
-    if re.search(r"\bunion\b", text, re.IGNORECASE):
+    if re.search(
+        r"\bunion\b",
+        text,
+        re.IGNORECASE
+    ):
         return "SQL_METACHAR"
 
-    if re.search(r"\bor\s+1\s*=\s*1\b", text, re.IGNORECASE):
+    if re.search(
+        r"\bor\s+1\s*=\s*1\b",
+        text,
+        re.IGNORECASE
+    ):
         return "SQL_METACHAR"
 
     return None
 
 
-# -------------------------------------------------
-# SHELL RULES
-# -------------------------------------------------
+# =================================================
+# SHELL
+# =================================================
 
 def check_shell(text):
 
-    if any(char in text for char in ";&|`<>"):
+    # ; & | ` < >
+
+    if any(
+        char in text
+        for char in ";&|`<>"
+    ):
         return "SHELL_METACHAR"
+
+    # $(
 
     if "$(" in text:
         return "SHELL_METACHAR"
+
+    # ${
 
     if "${" in text:
         return "SHELL_METACHAR"
@@ -340,9 +404,9 @@ def check_shell(text):
     return None
 
 
-# -------------------------------------------------
-# CHANNEL CHECK
-# -------------------------------------------------
+# =================================================
+# CHANNEL DISPATCH
+# =================================================
 
 def check_channel(channel, text):
 
@@ -364,42 +428,69 @@ def check_channel(channel, text):
     return None
 
 
-# -------------------------------------------------
-# MAIN ENDPOINT
-# -------------------------------------------------
+# =================================================
+# SANITIZE ENDPOINT
+# =================================================
 
-@app.route("/sanitize-output", methods=["POST"])
+@app.route(
+    "/sanitize-output",
+    methods=["POST"]
+)
 def sanitize_output():
 
     # =================================================
     # RULE 1: INVALID_SCHEMA
     # =================================================
 
-    if not request.is_json:
-        return result(False, "INVALID_SCHEMA")
-
-    data = request.get_json(silent=True)
+    try:
+        data = request.get_json(
+            force=True,
+            silent=False
+        )
+    except Exception:
+        return result(
+            False,
+            "INVALID_SCHEMA"
+        )
 
     if type(data) is not dict:
-        return result(False, "INVALID_SCHEMA")
+        return result(
+            False,
+            "INVALID_SCHEMA"
+        )
 
     if "channel" not in data:
-        return result(False, "INVALID_SCHEMA")
+        return result(
+            False,
+            "INVALID_SCHEMA"
+        )
 
     if "output" not in data:
-        return result(False, "INVALID_SCHEMA")
+        return result(
+            False,
+            "INVALID_SCHEMA"
+        )
 
     channel = data["channel"]
     output = data["output"]
 
     if channel not in CHANNELS:
-        return result(False, "INVALID_SCHEMA")
+        return result(
+            False,
+            "INVALID_SCHEMA"
+        )
 
     if type(output) is not str:
-        return result(False, "INVALID_SCHEMA")
+        return result(
+            False,
+            "INVALID_SCHEMA"
+        )
 
     if len(output) > 20000:
-        return result(False, "INVALID_SCHEMA")
+        return result(
+            False,
+            "INVALID_SCHEMA"
+        )
 
     # =================================================
     # RULE 2: ENCODED_PAYLOAD
@@ -409,45 +500,67 @@ def sanitize_output():
 
     if decoded != output:
 
-        decoded_reason = check_channel(channel, decoded)
+        decoded_reason = check_channel(
+            channel,
+            decoded
+        )
 
         if decoded_reason is not None:
-            return result(False, "ENCODED_PAYLOAD")
+            return result(
+                False,
+                "ENCODED_PAYLOAD"
+            )
 
     # =================================================
     # RULE 3: ORIGINAL OUTPUT
     # =================================================
 
-    reason = check_channel(channel, output)
+    reason = check_channel(
+        channel,
+        output
+    )
 
     if reason is not None:
-        return result(False, reason)
+        return result(
+            False,
+            reason
+        )
 
     # =================================================
     # SAFE
     # =================================================
 
-    return result(True, "SAFE")
+    return result(
+        True,
+        "SAFE"
+    )
 
 
-# -------------------------------------------------
+# =================================================
 # HEALTH CHECK
-# -------------------------------------------------
+# =================================================
 
 @app.route("/", methods=["GET"])
 def home():
+
     return jsonify({
         "status": "ok",
         "service": "llm-output-handling-gate"
     })
 
 
-# -------------------------------------------------
+# =================================================
 # START
-# -------------------------------------------------
+# =================================================
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            5000
+        )
+    )
 
     app.run(
         host="0.0.0.0",
